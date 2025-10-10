@@ -1,0 +1,106 @@
+name: Audit Actions Used in Workflows
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * 1" # every Monday at 03:00 UTC
+
+jobs:
+  audit-actions:
+    name: Audit GitHub Actions
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install dependencies
+        run: pip install requests pyyaml tabulate
+
+      - name: Run audit
+        id: audit
+        run: |
+          import os, re, yaml, requests, datetime
+          from tabulate import tabulate
+
+          GITHUB_API = "https://api.github.com"
+          OPENSSF_API = "https://api.securityscorecards.dev/projects/github.com"
+
+          def find_actions_in_workflows():
+              actions = set()
+              for root, _, files in os.walk(".github/workflows"):
+                  for f in files:
+                      if f.endswith((".yml", ".yaml")):
+                          with open(os.path.join(root, f)) as wf:
+                              data = yaml.safe_load(wf)
+                              if not data: continue
+                              for job in data.get("jobs", {}).values():
+                                  for step in job.get("steps", []):
+                                      if isinstance(step, dict) and "uses" in step:
+                                          uses = step["uses"]
+                                          m = re.match(r"([\w\-]+\/[\w\-]+)(?:@.+)?", uses)
+                                          if m: actions.add(m.group(1))
+              return sorted(actions)
+
+          def get_repo_data(repo):
+              r = requests.get(f"{GITHUB_API}/repos/{repo}")
+              if r.status_code != 200:
+                  return {"latest_commit": "N/A", "archived": "N/A", "error": f"Repo not found ({r.status_code})"}
+              info = r.json()
+              archived = info.get("archived", False)
+              commits = requests.get(f"{GITHUB_API}/repos/{repo}/commits?per_page=1")
+              if commits.status_code == 200 and len(commits.json()) > 0:
+                  c = commits.json()[0]
+                  latest_commit = f"{c['commit']['committer']['date']} by {c['commit']['committer']['name']}"
+              else:
+                  latest_commit = "No commits found"
+              return {"archived": archived, "latest_commit": latest_commit}
+
+          def get_openssf_score(repo):
+              url = f"{OPENSSF_API}/{repo}"
+              r = requests.get(url)
+              if r.status_code == 200:
+                  data = r.json()
+                  score = data.get("score", {}).get("overall", "N/A")
+                  return score
+              return "N/A"
+
+          actions = find_actions_in_workflows()
+          results = []
+
+          for action in actions:
+              repo_data = get_repo_data(action)
+              score = get_openssf_score(action)
+              is_eol = "YES" if repo_data["archived"] or "2022" in repo_data["latest_commit"] else "NO"
+              results.append({
+                  "Action": action,
+                  "OpenSSF Score": score,
+                  "Last Commit": repo_data["latest_commit"],
+                  "Archived": repo_data["archived"],
+                  "End of Life": is_eol
+              })
+
+          report_md = "# 🧮 GitHub Actions Audit Report\n\n"
+          report_md += f"Generated: {datetime.datetime.utcnow().isoformat()} UTC\n\n"
+          report_md += "This report lists all Actions used in workflows with their OpenSSF score, latest commit info, and EOL status.\n\n"
+          report_md += "```\n" + tabulate(
+              [[r["Action"], r["OpenSSF Score"], r["Last Commit"], r["Archived"], r["End of Life"]] for r in results],
+              headers=["Action", "OpenSSF Score", "Last Commit", "Archived", "EOL"]
+          ) + "\n```"
+
+          os.makedirs("audit-report", exist_ok=True)
+          with open("audit-report/actions_audit.md", "w") as f:
+              f.write(report_md)
+
+          print(report_md)
+
+      - name: Upload audit report
+        uses: actions/upload-artifact@v4
+        with:
+          name: actions-audit-report
+          path: audit-report/actions_audit.md
